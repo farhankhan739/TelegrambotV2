@@ -46,6 +46,22 @@ Configuration:
         "destination_link": "https://t.me/+XXXXXXXXXXXX"
       }
     }
+
+    3) Multiple channels behind one parameter - use "channels": [...]
+       instead of putting channel fields directly on the campaign. The
+       user must submit a join request to EVERY channel listed before
+       Verify passes. Mixing public and private channels is fine, and an
+       optional "label" controls the button text ("Channel N" if omitted):
+
+    {
+      "multi": {
+        "channels": [
+          { "chat_id": -1001111111111, "invite_link": "https://t.me/+aaa", "label": "Main Channel" },
+          { "channel_username": "@PublicBackup", "label": "Public Backup" }
+        ],
+        "destination_link": "https://t.me/+XXXXXXXXXXXX"
+      }
+    }
 """
 
 import asyncio
@@ -110,6 +126,36 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DB_PATH = os.path.join(BASE_DIR, "join_requests.db")
 
 
+def _validate_channel(channel: Any) -> Optional[Dict[str, Any]]:
+    """
+    Validates a single channel entry (one item of a campaign's "channels"
+    list, or the legacy single-channel fields living directly on the
+    campaign). Returns a normalized dict, or None if invalid.
+    """
+    if not isinstance(channel, dict):
+        return None
+
+    if channel.get("channel_username"):
+        return {
+            "channel_username": channel["channel_username"],
+            "label": channel.get("label"),
+        }
+
+    if channel.get("chat_id") and channel.get("invite_link"):
+        if not isinstance(channel["chat_id"], int):
+            logger.warning(
+                "'chat_id' must be a JSON integer (e.g. -1001234567890), not a string."
+            )
+            return None
+        return {
+            "chat_id": channel["chat_id"],
+            "invite_link": channel["invite_link"],
+            "label": channel.get("label"),
+        }
+
+    return None
+
+
 def load_config(path: str) -> Dict[str, Any]:
     """
     Loads the campaign configuration from config.json exactly once at
@@ -117,6 +163,12 @@ def load_config(path: str) -> Dict[str, Any]:
     is missing or malformed, so the bot can still start and simply
     report "Invalid or expired link." for every deep link rather than
     crashing.
+
+    Every campaign is normalized internally to:
+        {"channels": [ {...channel...}, ... ], "destination_link": "..."}
+    regardless of whether config.json used the legacy single-channel shape
+    (channel_username / chat_id+invite_link directly on the campaign) or the
+    newer "channels": [...] list for gating behind multiple channels at once.
     """
     if not os.path.exists(path):
         logger.warning(
@@ -148,29 +200,37 @@ def load_config(path: str) -> Dict[str, Any]:
             )
             continue
 
-        has_username = bool(value.get("channel_username"))
-        has_private_fields = bool(value.get("chat_id")) and bool(value.get("invite_link"))
-
-        if has_username:
-            # Public-channel shape: {"channel_username": ..., "destination_link": ...}
-            validated[key] = value
-        elif has_private_fields:
-            # Private-channel shape: {"chat_id": ..., "invite_link": ..., "destination_link": ...}
-            if not isinstance(value.get("chat_id"), int):
-                logger.warning(
-                    "Skipping campaign '%s': 'chat_id' must be a JSON integer "
-                    "(e.g. -1001234567890), not a string.",
-                    key,
-                )
-                continue
-            validated[key] = value
-        else:
+        # Accept either the new "channels": [...] list, or fall back to
+        # treating the campaign's own top-level fields as a single channel
+        # (legacy shape, still fully supported).
+        raw_channels = value.get("channels", [value])
+        if not isinstance(raw_channels, list) or not raw_channels:
             logger.warning(
-                "Skipping campaign '%s': must provide either 'channel_username' "
-                "(public channel) or both 'chat_id' and 'invite_link' "
-                "(private channel).",
-                key,
+                "Skipping campaign '%s': 'channels' must be a non-empty list.", key
             )
+            continue
+
+        channels = []
+        campaign_invalid = False
+        for i, raw_channel in enumerate(raw_channels, start=1):
+            validated_channel = _validate_channel(raw_channel)
+            if validated_channel is None:
+                logger.warning(
+                    "Skipping campaign '%s': channel #%d is invalid - each "
+                    "channel needs either 'channel_username' (public) or "
+                    "both 'chat_id' (int) and 'invite_link' (private).",
+                    key,
+                    i,
+                )
+                campaign_invalid = True
+                break
+            validated_channel.setdefault("label", f"Channel {i}")
+            channels.append(validated_channel)
+
+        if campaign_invalid:
+            continue
+
+        validated[key] = {"channels": channels, "destination_link": value["destination_link"]}
 
     logger.info("Loaded %d campaign(s) from config.json.", len(validated))
     return validated
@@ -276,61 +336,91 @@ async def resolve_channel_chat_id(
         return None
 
 
-async def get_campaign_chat_id(
-    context: ContextTypes.DEFAULT_TYPE, campaign: Dict[str, Any]
+async def get_channel_chat_id(
+    context: ContextTypes.DEFAULT_TYPE, channel: Dict[str, Any]
 ) -> Optional[int]:
     """
-    Returns the numeric chat_id to match join requests against, for either
-    campaign shape:
+    Returns the numeric chat_id to match join requests against, for a
+    single channel entry:
       - Public (channel_username): resolved via get_chat (and cached).
       - Private (chat_id given directly in config.json): returned as-is,
         no API call needed since there's no username to look up.
     """
-    if campaign.get("channel_username"):
-        return await resolve_channel_chat_id(context, campaign["channel_username"])
+    if channel.get("channel_username"):
+        return await resolve_channel_chat_id(context, channel["channel_username"])
     # Private-channel shape already has the numeric chat_id in config.
-    return campaign.get("chat_id")
+    return channel.get("chat_id")
 
 
-def get_campaign_join_url(campaign: Dict[str, Any]) -> str:
+def get_channel_join_url(channel: Dict[str, Any]) -> str:
     """
-    Returns the URL the "Request to Join" button should open, for either
-    campaign shape:
+    Returns the URL the "Request to Join" button should open, for a single
+    channel entry:
       - Public (channel_username): built as https://t.me/<username>.
       - Private (invite_link given directly in config.json): used as-is,
         since a private channel has no username to build a link from.
     """
-    if campaign.get("channel_username"):
-        return f"https://t.me/{campaign['channel_username'].lstrip('@')}"
-    return campaign["invite_link"]
+    if channel.get("channel_username"):
+        return f"https://t.me/{channel['channel_username'].lstrip('@')}"
+    return channel["invite_link"]
+
+
+async def check_campaign_verified(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, campaign: Dict[str, Any]
+) -> bool:
+    """
+    A campaign is verified only if the user has a recorded join request for
+    EVERY channel in campaign["channels"]. Short-circuits (and fails safe)
+    on the first channel that's missing a request or can't be resolved.
+    """
+    for channel in campaign["channels"]:
+        chat_id = await get_channel_chat_id(context, channel)
+        if chat_id is None:
+            logger.error(
+                "Skipping verification for user %s - channel '%s' could not "
+                "be resolved to a chat_id.",
+                user_id,
+                channel.get("channel_username") or channel.get("chat_id"),
+            )
+            return False
+        if not await has_join_request(context, user_id, chat_id):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
-def build_gate_keyboard(channel_url: str, campaign_key: str) -> InlineKeyboardMarkup:
+def build_gate_keyboard(
+    channels: list, campaign_key: str
+) -> InlineKeyboardMarkup:
     """
-    Builds the two-button keyboard shown on /start:
-        1. Join Channel (url button) - opens the channel so the user can
-           submit a join request.
-        2. Verify (callback button) - checks whether we've received a
-           chat_join_request event for this user + channel.
+    Builds the gate keyboard shown on /start:
+        1. One "Join <label>" button per channel in the campaign (url
+           button) - opens each channel so the user can submit a join
+           request.
+        2. A single Verify (callback button) - checks whether we've
+           received a chat_join_request event for this user for EVERY
+           channel in the campaign.
     """
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(text="📢 Request to Join", url=channel_url)],
-            [InlineKeyboardButton(text="✅ Verify", callback_data=f"verify:{campaign_key}")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📢 Join {channel.get('label', 'Channel')}",
+            url=get_channel_join_url(channel),
+        )]
+        for channel in channels
+    ]
+    rows.append([InlineKeyboardButton(text="✅ Verify", callback_data=f"verify:{campaign_key}")])
+    return InlineKeyboardMarkup(rows)
 
 
 WELCOME_TEXT = (
     "👋 Welcome!\n\n"
-    "Tap *Request to Join* below and submit a join request in the channel, "
-    "then come back and tap *Verify*.\n\n"
-    "_You don't need to wait for your request to be approved - submitting "
-    "the request is enough to verify here._"
+    "Tap each *Join* button below and submit a join request in every "
+    "channel listed, then come back and tap *Verify*.\n\n"
+    "_You don't need to wait for your request(s) to be approved - "
+    "submitting the request is enough to verify here._"
 )
 
 
@@ -353,9 +443,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     campaign = CAMPAIGNS[param]
-    channel_url = get_campaign_join_url(campaign)
-
-    keyboard = build_gate_keyboard(channel_url, param)
+    keyboard = build_gate_keyboard(campaign["channels"], param)
 
     await message.reply_text(
         text=WELCOME_TEXT,
@@ -419,21 +507,7 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     destination_link = campaign["destination_link"]
-    channel_url = get_campaign_join_url(campaign)
-
-    channel_chat_id = await get_campaign_chat_id(context, campaign)
-
-    verified = False
-    if channel_chat_id is not None:
-        verified = await has_join_request(context, user.id, channel_chat_id)
-    else:
-        # Fail safe: if we can't even resolve the channel, we can't verify.
-        logger.error(
-            "Skipping verification for user %s - campaign '%s' could not be "
-            "resolved to a chat_id.",
-            user.id,
-            campaign_key,
-        )
+    verified = await check_campaign_verified(context, user.id, campaign)
 
     if verified:
         try:
@@ -450,13 +524,14 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_markup=destination_keyboard,
         )
     else:
-        keyboard = build_gate_keyboard(channel_url, campaign_key)
+        keyboard = build_gate_keyboard(campaign["channels"], campaign_key)
         await context.bot.send_message(
             chat_id=user.id,
             text=(
-                "❌ We haven't received a join request from you yet.\n\n"
-                "Please tap *Request to Join*, submit the request in the "
-                "channel, then come back and tap *Verify* again."
+                "❌ We haven't received a join request from you for all "
+                "required channels yet.\n\n"
+                "Please tap each *Join* button, submit a join request in "
+                "every channel, then come back and tap *Verify* again."
             ),
             parse_mode="Markdown",
             reply_markup=keyboard,
