@@ -6,11 +6,6 @@ bot.py
 
 A Telegram deep-link gateway bot built with python-telegram-bot v22+.
 
-This version verifies users via the "chat_join_request" update instead of
-get_chat_member. It works with channels that have "Approve New Members"
-(join requests) enabled: the user only needs to SUBMIT a join request,
-not be approved as a full member, to pass verification.
-
 Run locally or on Railway with:
     python bot.py
 
@@ -19,30 +14,87 @@ Environment variables required:
 
 Configuration:
     config.json (same directory as this file) - maps deep-link parameters
-    to a target channel + destination link. Example:
+    to a target channel + destination link. Each campaign can choose ONE
+    of two verification modes:
+
+    Mode "membership" (Config Style A is NOT this - see below, this is
+    the default / backward-compatible mode):
+        The bot calls get_chat_member and only unlocks the destination
+        link once the user is an actual MEMBER/ADMIN/OWNER of the
+        channel. This is the original behaviour of this bot.
+
+    Mode "join_request":
+        The bot listens for Telegram's native "join request" events
+        (used when a channel's invite link has "Approve new members"
+        turned on). As soon as a user taps Join and their request comes
+        in, the bot records it - the user does NOT need to wait for
+        anyone to approve them, and does NOT need to already show up
+        as a member. This is useful for private channels / campaigns
+        where you want a fast, request-based unlock instead of a full
+        membership check.
+
+    Example config.json:
 
     {
       "jjk": {
         "channel_username": "@AnimeStreet_backup",
-        "destination_link": "https://t.me/+3RnRB0avwhk1OTBl"
+        "destination_link": "https://t.me/+3RnRB0avwhk1OTBl",
+        "verification_mode": "membership"
+      },
+      "ddd": {
+        "channel_username": "@AnimeStreet_backup",
+        "destination_link": "https://t.me/+Dy-rWieJUOI3Y2E9",
+        "verification_mode": "join_request",
+        "auto_approve": true
       }
     }
+
+    Field reference:
+        channel_username   Required. Public @username of the channel, OR
+                            the username to match against for join
+                            requests. Include the "@".
+        channel_id         Optional. Numeric chat id of the channel.
+                            Recommended (and required for PRIVATE
+                            channels with no public username) since
+                            get_chat_member / approve_chat_join_request
+                            need a real chat id or public username to
+                            work reliably.
+        channel_url        Optional. Overrides the URL used for the
+                            "Join Channel" button. If omitted, it's
+                            derived from channel_username
+                            (https://t.me/<username>). Set this
+                            explicitly for private channels where you
+                            need to share the actual invite link.
+        destination_link   Required. The link revealed after
+                            verification succeeds.
+        verification_mode  Optional. "membership" (default) or
+                            "join_request".
+        auto_approve       Optional, only used when verification_mode
+                            is "join_request". Defaults to true - the
+                            bot immediately approves the join request
+                            (via approve_chat_join_request) so the user
+                            also lands in the channel. Set to false if
+                            you'd rather approve requests manually and
+                            just use the request itself as the unlock
+                            signal.
+
+    IMPORTANT for "join_request" mode: the bot must be an ADMINISTRATOR
+    of the channel with the "Add New Admins"-adjacent permission that
+    lets it manage/approve join requests (in Telegram this is bundled
+    under the channel admin's "Invite Users via Link" permission).
 """
 
-import asyncio
 import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set, Union
 
-import aiosqlite
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatMemberStatus
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
@@ -76,19 +128,18 @@ if not BOT_TOKEN:
         "BOT_TOKEN environment variable is not set. "
         "Set it locally in a .env file or in Railway's Variables tab."
     )
+    # Exit immediately - there is no point starting the bot without a token.
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Paths (same directory as this script)
+# Path to the campaign configuration file (same directory as this script)
 # ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-# SQLite file used to persist join requests across restarts.
-# NOTE: on some hosts (see "Limitations" below) the filesystem is wiped on
-# every redeploy, so this is not a substitute for a real external DB if you
-# need requests to survive redeploys, not just process restarts/crashes.
-DB_PATH = os.path.join(BASE_DIR, "join_requests.db")
+# Verification mode constants
+MODE_MEMBERSHIP = "membership"
+MODE_JOIN_REQUEST = "join_request"
+VALID_MODES = {MODE_MEMBERSHIP, MODE_JOIN_REQUEST}
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -121,20 +172,50 @@ def load_config(path: str) -> Dict[str, Any]:
         logger.error("config.json must contain a top-level JSON object. Ignoring file.")
         return {}
 
+    # Validate each campaign entry; skip (and warn about) malformed ones
+    # instead of letting one bad entry break the whole config.
     validated: Dict[str, Any] = {}
     for key, value in data.items():
-        if (
+        if not (
             isinstance(value, dict)
             and value.get("channel_username")
             and value.get("destination_link")
         ):
-            validated[key] = value
-        else:
             logger.warning(
                 "Skipping campaign '%s': missing 'channel_username' or "
                 "'destination_link'.",
                 key,
             )
+            continue
+
+        mode = value.get("verification_mode", MODE_MEMBERSHIP)
+        if mode not in VALID_MODES:
+            logger.warning(
+                "Campaign '%s' has invalid verification_mode '%s'. "
+                "Falling back to '%s'.",
+                key,
+                mode,
+                MODE_MEMBERSHIP,
+            )
+            mode = MODE_MEMBERSHIP
+        value["verification_mode"] = mode
+
+        # auto_approve only matters for join_request mode; default True.
+        value["auto_approve"] = bool(value.get("auto_approve", True))
+
+        # channel_id, if present, must be an int (Telegram chat ids).
+        if "channel_id" in value and value["channel_id"] is not None:
+            try:
+                value["channel_id"] = int(value["channel_id"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Campaign '%s' has a non-numeric channel_id (%r). Ignoring it.",
+                    key,
+                    value["channel_id"],
+                )
+                value["channel_id"] = None
+
+        validated[key] = value
 
     logger.info("Loaded %d campaign(s) from config.json.", len(validated))
     return validated
@@ -146,126 +227,146 @@ CAMPAIGNS: Dict[str, Any] = load_config(CONFIG_PATH)
 
 
 # ---------------------------------------------------------------------------
-# Persistence layer: pending join requests
+# In-memory store of join requests we've seen, for campaigns running in
+# "join_request" mode. NOTE: this resets whenever the process restarts
+# (e.g. on a Railway redeploy). That's fine for most gateway use-cases
+# since users can just tap Join again, but if you need it to survive
+# restarts you'd want to persist this to a file or small database.
+#
+# Keyed by a normalized "channel key" (see channel_keys_for_campaign)
+# -> set of user_ids who have an active join request recorded.
 # ---------------------------------------------------------------------------
-# We store (user_id, chat_id) pairs the moment Telegram tells us a user has
-# submitted a join request. A single shared aiosqlite connection + lock is
-# kept on `application.bot_data` for the life of the process, so every
-# handler call reuses the same connection instead of opening a new file
-# handle per request (this also avoids "database is locked" errors under
-# concurrent writes from multiple users).
-
-async def init_db(application: Application) -> None:
-    db = await aiosqlite.connect(DB_PATH)
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS join_requests (
-            user_id INTEGER NOT NULL,
-            chat_id INTEGER NOT NULL,
-            requested_at TEXT NOT NULL,
-            PRIMARY KEY (user_id, chat_id)
-        )
-        """
-    )
-    await db.commit()
-    application.bot_data["db"] = db
-    application.bot_data["db_lock"] = asyncio.Lock()
-    application.bot_data["channel_id_cache"] = {}
-    logger.info("Join-request database ready at %s", DB_PATH)
+JOIN_REQUESTS: Dict[str, Set[int]] = {}
 
 
-async def close_db(application: Application) -> None:
-    db = application.bot_data.get("db")
-    if db is not None:
-        await db.close()
-
-
-async def record_join_request(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int) -> None:
-    db: aiosqlite.Connection = context.application.bot_data["db"]
-    lock: asyncio.Lock = context.application.bot_data["db_lock"]
-    async with lock:
-        await db.execute(
-            "INSERT OR REPLACE INTO join_requests (user_id, chat_id, requested_at) VALUES (?, ?, ?)",
-            (user_id, chat_id, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-
-
-async def has_join_request(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int) -> bool:
-    db: aiosqlite.Connection = context.application.bot_data["db"]
-    lock: asyncio.Lock = context.application.bot_data["db_lock"]
-    async with lock:
-        cursor = await db.execute(
-            "SELECT 1 FROM join_requests WHERE user_id = ? AND chat_id = ?",
-            (user_id, chat_id),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-    return row is not None
-
-
-async def resolve_channel_chat_id(
-    context: ContextTypes.DEFAULT_TYPE, channel_username: str
-) -> Optional[int]:
+def channel_keys_for_campaign(campaign: Dict[str, Any]) -> Set[str]:
     """
-    Resolves a config channel_username (e.g. "@AnimeStreet_backup") to its
-    numeric chat_id, using get_chat, and caches the result for the life of
-    the process. We need the numeric chat_id because that's what arrives on
-    the chat_join_request update (update.chat_join_request.chat.id) - matching
-    on numeric ID is more robust than string-matching usernames.
-
-    Returns None if the channel can't be resolved (e.g. bot isn't an admin,
-    or the username is wrong) - callers should fail safe in that case.
+    Returns the set of normalized keys that identify a campaign's channel,
+    used to look up / record entries in JOIN_REQUESTS. We track both the
+    numeric channel_id (if configured) and the @username so a join
+    request event matches regardless of which one Telegram gives us.
     """
-    cache: Dict[str, int] = context.application.bot_data["channel_id_cache"]
-    key = channel_username.lower()
-    if key in cache:
-        return cache[key]
+    keys: Set[str] = set()
+    channel_id = campaign.get("channel_id")
+    if channel_id is not None:
+        keys.add(f"id:{channel_id}")
+    channel_username = campaign.get("channel_username")
+    if channel_username:
+        keys.add(f"username:{channel_username.lstrip('@').lower()}")
+    return keys
 
+
+def channel_ref_for_campaign(campaign: Dict[str, Any]) -> Union[int, str]:
+    """
+    Returns whatever should be passed as chat_id to Telegram API calls
+    (get_chat_member, approve_chat_join_request): prefer the numeric
+    channel_id if configured (works for private channels too), else
+    fall back to the @username.
+    """
+    channel_id = campaign.get("channel_id")
+    if channel_id is not None:
+        return channel_id
+    return campaign["channel_username"]
+
+
+# Chat member statuses that count as "is a member" for our purposes.
+# Excludes LEFT and BANNED/KICKED.
+MEMBER_STATUSES = {
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.OWNER,
+}
+
+
+async def check_membership(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_ref: Union[int, str]
+) -> bool:
+    """
+    Checks whether a user is currently a member of chat_ref (a channel
+    username like "@Foo" or a numeric channel id).
+
+    IMPORTANT: the bot must be an ADMINISTRATOR of the target channel for
+    get_chat_member to succeed. If it isn't (or the channel is invalid),
+    Telegram raises an error, which we catch and treat as "not a member"
+    so the gateway fails safe instead of crashing.
+    """
     try:
-        chat = await context.bot.get_chat(chat_id=channel_username)
-        cache[key] = chat.id
-        return chat.id
-    except (BadRequest, Forbidden) as exc:
+        member = await context.bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+        return member.status in MEMBER_STATUSES
+    except Forbidden as exc:
         logger.error(
-            "Could not resolve channel '%s' to a chat_id: %s. "
-            "Make sure the bot is an ADMIN of this channel and the "
-            "username in config.json is correct.",
-            channel_username,
+            "Forbidden checking membership in %s: %s. "
+            "Make sure the bot is an ADMIN of this channel.",
+            chat_ref,
             exc,
         )
-        return None
+        return False
+    except BadRequest as exc:
+        logger.error("BadRequest checking membership in %s: %s", chat_ref, exc)
+        return False
     except TelegramError as exc:
-        logger.error("Telegram error resolving channel '%s': %s", channel_username, exc)
-        return None
+        logger.error("Telegram error checking membership in %s: %s", chat_ref, exc)
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
+def has_pending_join_request(user_id: int, campaign: Dict[str, Any]) -> bool:
+    """
+    Mode "join_request" check: True if we've recorded a join-request
+    event from this user for this campaign's channel.
+    """
+    for key in channel_keys_for_campaign(campaign):
+        if user_id in JOIN_REQUESTS.get(key, set()):
+            return True
+    return False
+
+
+async def is_verified(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, campaign: Dict[str, Any]
+) -> bool:
+    """
+    Single entry point used by the "Continue" button to decide whether a
+    user has satisfied a campaign's requirement. Dispatches based on the
+    campaign's configured verification_mode:
+
+        "join_request" -> has the user sent a join request we recorded?
+        "membership"   -> (default) is the user currently a channel member?
+    """
+    mode = campaign.get("verification_mode", MODE_MEMBERSHIP)
+    if mode == MODE_JOIN_REQUEST:
+        return has_pending_join_request(user_id, campaign)
+
+    chat_ref = channel_ref_for_campaign(campaign)
+    return await check_membership(context, user_id, chat_ref)
+
 
 def build_gate_keyboard(channel_url: str, campaign_key: str) -> InlineKeyboardMarkup:
     """
     Builds the two-button keyboard shown on /start:
-        1. Join Channel (url button) - opens the channel so the user can
-           submit a join request.
-        2. Verify (callback button) - checks whether we've received a
-           chat_join_request event for this user + channel.
+        1. Join Channel (url button)
+        2. Continue (callback button - triggers a membership check)
     """
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(text="📢 Request to Join", url=channel_url)],
-            [InlineKeyboardButton(text="✅ Verify", callback_data=f"verify:{campaign_key}")],
+            [InlineKeyboardButton(text="📢 Join Channel", url=channel_url)],
+            [InlineKeyboardButton(text="➡️ Continue", callback_data=f"verify:{campaign_key}")],
         ]
     )
 
 
+def channel_url_for_campaign(campaign: Dict[str, Any]) -> str:
+    """
+    Returns the URL to use for the "Join Channel" button: an explicit
+    channel_url override if configured, otherwise derived from
+    channel_username.
+    """
+    if campaign.get("channel_url"):
+        return campaign["channel_url"]
+    return f"https://t.me/{campaign['channel_username'].lstrip('@')}"
+
+
 WELCOME_TEXT = (
     "👋 Welcome!\n\n"
-    "Tap *Request to Join* below and submit a join request in the channel, "
-    "then come back and tap *Verify*.\n\n"
-    "_You don't need to wait for your request to be approved - submitting "
-    "the request is enough to verify here._"
+    "Please join our channel first, then tap *Continue* to proceed."
 )
 
 
@@ -279,18 +380,19 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if message is None:
         return
 
+    # context.args contains whatever follows "/start ", split by spaces.
+    # e.g. "/start jjk" -> context.args == ["jjk"]
     args = context.args
     param = args[0].strip().lower() if args else None
 
+    # No parameter, or parameter not found in our loaded config.
     if not param or param not in CAMPAIGNS:
         logger.info("Invalid or missing deep-link parameter: %r", param)
         await message.reply_text("Invalid or expired link.")
         return
 
     campaign = CAMPAIGNS[param]
-    channel_username = campaign["channel_username"]
-    channel_url = f"https://t.me/{channel_username.lstrip('@')}"
-
+    channel_url = channel_url_for_campaign(campaign)
     keyboard = build_gate_keyboard(channel_url, param)
 
     await message.reply_text(
@@ -300,41 +402,18 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Fires on every "chat_join_request" update Telegram sends us - i.e. the
-    instant a user submits a join request in a channel/group where the bot
-    is an admin. We record (user_id, chat_id) immediately; we do NOT
-    approve or decline the request here, so the user remains "pending" in
-    the channel exactly as before - we're only using this event as a signal.
-    """
-    jr = update.chat_join_request
-    if jr is None:
-        return
-
-    user_id = jr.from_user.id
-    chat_id = jr.chat.id
-
-    await record_join_request(context, user_id, chat_id)
-    logger.info(
-        "Recorded join request: user_id=%s chat_id=%s (@%s)",
-        user_id,
-        chat_id,
-        jr.chat.username,
-    )
-
-
 async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles taps on the "✅ Verify" button.
+    Handles taps on the "➡️ Continue" button.
 
-    callback_data is "verify:<campaign_key>". Instead of calling
-    get_chat_member, we look up whether we've already recorded a
-    chat_join_request event for this user + the campaign's channel:
-        - If found -> treat as verified, delete the gate message, and
-          send the destination link.
-        - If not found -> tell the user to submit a join request first
-          and re-show the gate message.
+    callback_data is "verify:<campaign_key>". Depending on the
+    campaign's verification_mode, we either check current channel
+    membership or check whether we've recorded a join request:
+        - If verified -> delete the gate message (it "vanishes") and
+          send a NEW message with the destination link as a button.
+        - If not -> re-send (forward again, as a new message, not an
+          edit) the same welcome message with the same two buttons so
+          they can try again.
     """
     query = update.callback_query
     user = update.effective_user
@@ -354,27 +433,20 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await context.bot.send_message(chat_id=user.id, text="Invalid or expired link.")
         return
 
-    channel_username = campaign["channel_username"]
     destination_link = campaign["destination_link"]
-    channel_url = f"https://t.me/{channel_username.lstrip('@')}"
+    channel_url = channel_url_for_campaign(campaign)
 
-    channel_chat_id = await resolve_channel_chat_id(context, channel_username)
-
-    verified = False
-    if channel_chat_id is not None:
-        verified = await has_join_request(context, user.id, channel_chat_id)
-    else:
-        # Fail safe: if we can't even resolve the channel, we can't verify.
-        logger.error(
-            "Skipping verification for user %s - channel '%s' could not be resolved.",
-            user.id,
-            channel_username,
-        )
+    verified = await is_verified(context, user.id, campaign)
 
     if verified:
+        # User has joined (or requested to join) - delete the gate
+        # message so it vanishes from the chat, then send a new message
+        # with the destination link.
         try:
             await query.message.delete()
         except (BadRequest, Forbidden) as exc:
+            # Not fatal - e.g. message already deleted, or too old to
+            # delete. Log it and continue to deliver the destination link.
             logger.warning("Could not delete gate message for user %s: %s", user.id, exc)
 
         destination_keyboard = InlineKeyboardMarkup(
@@ -386,17 +458,66 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_markup=destination_keyboard,
         )
     else:
+        # User hasn't joined / requested to join yet - forward (re-send)
+        # the same welcome message with the same two buttons, as a
+        # brand-new message.
         keyboard = build_gate_keyboard(channel_url, campaign_key)
         await context.bot.send_message(
             chat_id=user.id,
-            text=(
-                "❌ We haven't received a join request from you yet.\n\n"
-                "Please tap *Request to Join*, submit the request in the "
-                "channel, then come back and tap *Verify* again."
-            ),
+            text=WELCOME_TEXT,
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
+
+
+async def chat_join_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fires whenever someone taps Join on a channel invite link that has
+    "Approve new members" turned on, for ANY channel the bot administers.
+
+    We record the request (keyed by both the channel's numeric id and
+    its @username, so it matches campaigns configured either way), then
+    - if at least one "join_request"-mode campaign for that channel has
+    auto_approve enabled - immediately approve it so the user actually
+    lands in the channel too.
+    """
+    request = update.chat_join_request
+    if request is None:
+        return
+
+    user_id = request.from_user.id
+    chat = request.chat
+
+    id_key = f"id:{chat.id}"
+    username_key = f"username:{chat.username.lower()}" if chat.username else None
+
+    JOIN_REQUESTS.setdefault(id_key, set()).add(user_id)
+    if username_key:
+        JOIN_REQUESTS.setdefault(username_key, set()).add(user_id)
+
+    logger.info("Recorded join request from user %s for chat %s", user_id, chat.id)
+
+    # Auto-approve if any campaign pointing at this channel wants it.
+    should_auto_approve = any(
+        campaign.get("verification_mode") == MODE_JOIN_REQUEST
+        and campaign.get("auto_approve", True)
+        and (id_key in channel_keys_for_campaign(campaign) or username_key in channel_keys_for_campaign(campaign))
+        for campaign in CAMPAIGNS.values()
+    )
+
+    if should_auto_approve:
+        try:
+            await context.bot.approve_chat_join_request(chat_id=chat.id, user_id=user_id)
+            logger.info("Auto-approved join request for user %s in chat %s", user_id, chat.id)
+        except Forbidden as exc:
+            logger.error(
+                "Forbidden approving join request in %s: %s. "
+                "Make sure the bot is an ADMIN with permission to approve join requests.",
+                chat.id,
+                exc,
+            )
+        except TelegramError as exc:
+            logger.error("Telegram error approving join request in %s: %s", chat.id, exc)
 
 
 async def unknown_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -418,40 +539,26 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Unhandled exception while processing update %s", update, exc_info=context.error)
 
 
-async def post_init(application: Application) -> None:
-    await init_db(application)
-
-
-async def post_shutdown(application: Application) -> None:
-    await close_db(application)
-
-
 def main() -> None:
     """
     Builds the Application, registers all handlers, and starts polling.
     """
     logger.info("Starting bot...")
 
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # /start (with or without a deep-link parameter)
     application.add_handler(CommandHandler("start", start_handler))
 
-    # Fires the instant a user submits a join request in any chat where the
-    # bot is an admin. This MUST also be included in allowed_updates below,
-    # or Telegram will silently withhold these updates.
-    application.add_handler(ChatJoinRequestHandler(join_request_handler))
-
-    # "Verify" button -> callback_data starts with "verify:"
+    # "Continue" button -> callback_data starts with "verify:"
     application.add_handler(CallbackQueryHandler(continue_callback, pattern=r"^verify:"))
 
+    # Join-request events (only needed for campaigns using
+    # verification_mode "join_request", but harmless to register always).
+    application.add_handler(ChatJoinRequestHandler(chat_join_request_callback))
+
     # Fallback for any other command the bot doesn't explicitly handle.
+    # filters.COMMAND matches any message starting with "/".
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command_handler))
 
     # Global error handler for unhandled exceptions in any handler above.
@@ -459,9 +566,8 @@ def main() -> None:
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
-    # "chat_join_request" must be explicitly listed - it is NOT included in
-    # Telegram's default update set, so omitting it here means the handler
-    # above would simply never fire.
+    # Long polling - no webhook server, no open port required. This is
+    # exactly what's needed for a Railway "Worker" style deployment.
     application.run_polling(
         allowed_updates=["message", "callback_query", "chat_join_request"]
     )
