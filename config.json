@@ -1,13 +1,11 @@
 {
   "jjk": {
     "channel_username": "@AnimeStreet_backup",
-    "destination_link": "https://t.me/+3RnRB0avwhk1OTBl",
-    "verification_mode": "membership"
+    "destination_link": "https://t.me/+3RnRB0avwhk1OTBl"
   },
-  "ddd": {
-    "channel_username": "@AnimeStreet_backup",
-    "destination_link": "https://t.me/+Dy-rWieJUOI3Y2E9",
-    "verification_mode": "join_request",
-    "auto_approve": true
+  "nrt": {
+    "chat_id": -1004370947322,
+    "invite_link": "https://t.me/+0JUDOyjHYBs0Yjc1",
+    "destination_link": "https://t.me/+tHheKwMhJ5tlZDA1"
   }
 }
