@@ -1,11 +1,15 @@
+
 {
   "jjk": {
     "channel_username": "@AnimeStreet_backup",
     "destination_link": "https://t.me/+3RnRB0avwhk1OTBl"
   },
   "nrt": {
-    "chat_id": -1004370947322,
-    "invite_link": "https://t.me/+0JUDOyjHYBs0Yjc1",
+    "channels": [
+      { "chat_id": -1004370947322, "invite_link": "https://t.me/+0JUDOyjHYBs0Yjc1", "label": "English channel" },
+      { "chat_id": -1004433368398, "invite_link": "https://t.me/+NOcdVDVjaWQzZThl", "label": "Backup Channel 1" },
+      { "channel_username": "@AnimeStreet_backup", "label": "Public Backup" }
+    ],
     "destination_link": "https://t.me/+tHheKwMhJ5tlZDA1"
   }
 }
