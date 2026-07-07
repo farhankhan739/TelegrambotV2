@@ -6,8 +6,8 @@
   },
   "nrt": {
     "channels": [
-      { "chat_id": -1004370947322, "invite_link": "https://t.me/+0JUDOyjHYBs0Yjc1", "label": "." },
-      { "chat_id": -1004433368398, "invite_link": "https://t.me/+NOcdVDVjaWQzZThl", "label": "." },
+      { "chat_id": -1004370947322, "invite_link": "https://t.me/+0JUDOyjHYBs0Yjc1", "label": "" },
+      { "chat_id": -1004433368398, "invite_link": "https://t.me/+NOcdVDVjaWQzZThl", "label": "" },
       { "chat_id": -1003810986839, "invite_link": "https://t.me/+2gua9cnFtvE5MWNl", "label": ""    }
     ],
     "destination_link": "https://t.me/+tHheKwMhJ5tlZDA1"
