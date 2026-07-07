@@ -371,13 +371,54 @@ def get_channel_join_url(channel: Dict[str, Any]) -> str:
     return channel["invite_link"]
 
 
+async def is_channel_member(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
+) -> bool:
+    """
+    Fallback check for when there's no recorded join request: asks Telegram
+    directly whether the user is currently a member of the channel (e.g.
+    they were approved after a previous visit, or joined some other way).
+
+    Counts "member", "administrator", "creator", and "restricted" as joined
+    (restricted members are still in the chat, just with limited
+    permissions). "left" and "kicked" are not joined. Requires the bot to
+    be an admin of the channel - same requirement as everything else here.
+    """
+    try:
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+    except (BadRequest, Forbidden) as exc:
+        logger.warning(
+            "Could not check membership for user %s in chat %s: %s",
+            user_id,
+            chat_id,
+            exc,
+        )
+        return False
+    except TelegramError as exc:
+        logger.warning(
+            "Telegram error checking membership for user %s in chat %s: %s",
+            user_id,
+            chat_id,
+            exc,
+        )
+        return False
+
+    return member.status in ("member", "administrator", "creator", "restricted")
+
+
 async def check_campaign_verified(
     context: ContextTypes.DEFAULT_TYPE, user_id: int, campaign: Dict[str, Any]
 ) -> bool:
     """
-    A campaign is verified only if the user has a recorded join request for
-    EVERY channel in campaign["channels"]. Short-circuits (and fails safe)
-    on the first channel that's missing a request or can't be resolved.
+    A campaign is verified only if, for EVERY channel in
+    campaign["channels"], the user either:
+      1. Has a recorded chat_join_request event (the normal, fast path -
+         no API call needed), OR
+      2. Is already a current member of the channel - this covers the
+         case where they requested to join in a past session, we approved
+         them, and they're coming back later with nothing new to record.
+    Short-circuits (and fails safe) on the first channel that's missing
+    both, or that can't be resolved to a chat_id at all.
     """
     for channel in campaign["channels"]:
         chat_id = await get_channel_chat_id(context, channel)
@@ -389,8 +430,12 @@ async def check_campaign_verified(
                 channel.get("channel_username") or channel.get("chat_id"),
             )
             return False
-        if not await has_join_request(context, user_id, chat_id):
-            return False
+
+        if await has_join_request(context, user_id, chat_id):
+            continue
+        if await is_channel_member(context, chat_id, user_id):
+            continue
+        return False
     return True
 
 
@@ -424,6 +469,7 @@ def build_gate_keyboard(
 
 WELCOME_TEXT = (
     "<blockquote>Join the following channels to continue</blockquote>\n\n"
+    
 )
 
 
