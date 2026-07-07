@@ -119,6 +119,12 @@ if not BOT_TOKEN:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
+# The photo shown above the Join/Verify buttons on the gate message.
+# This must be a Telegram file_id (a string Telegram gives back once a photo
+# has been uploaded to it at least once) - see get_file_id_handler below for
+# the easiest way to obtain one. Leave empty ("") to send text-only, no photo.
+GATE_PHOTO_FILE_ID = os.environ.get("GATE_PHOTO_FILE_ID", "")
+
 # SQLite file used to persist join requests across restarts.
 # NOTE: on some hosts (see "Limitations" below) the filesystem is wiped on
 # every redeploy, so this is not a substitute for a real external DB if you
@@ -397,31 +403,100 @@ def build_gate_keyboard(
 ) -> InlineKeyboardMarkup:
     """
     Builds the gate keyboard shown on /start:
-        1. One "Join <label>" button per channel in the campaign (url
-           button) - opens each channel so the user can submit a join
-           request.
-        2. A single Verify (callback button) - checks whether we've
-           received a chat_join_request event for this user for EVERY
-           channel in the campaign.
+        1. One "Join <label>" button per channel, packed 2-per-row (the
+           last row has 1 button if the channel count is odd).
+        2. A single Verify (callback button) on its own row below all the
+           join buttons - checks whether we've received a chat_join_request
+           event for this user for EVERY channel in the campaign.
     """
-    rows = [
-        [InlineKeyboardButton(
+    join_buttons = [
+        InlineKeyboardButton(
             text=f"📢 Join {channel.get('label', 'Channel')}",
             url=get_channel_join_url(channel),
-        )]
+        )
         for channel in channels
     ]
+    rows = [join_buttons[i:i + 2] for i in range(0, len(join_buttons), 2)]
     rows.append([InlineKeyboardButton(text="✅ Verify", callback_data=f"verify:{campaign_key}")])
     return InlineKeyboardMarkup(rows)
 
 
 WELCOME_TEXT = (
-    "👋 Welcome!\n\n"
-    "Tap each *Join* button below and submit a join request in every "
-    "channel listed, then come back and tap *Verify*.\n\n"
-    "_You don't need to wait for your request(s) to be approved - "
-    "submitting the request is enough to verify here._"
+    "<blockquote>Join the following channels to continue</blockquote>\n\n"
+    "Tap each <b>Join</b> button below and submit a join request in every "
+    "channel listed, then come back and tap <b>Verify</b>.\n\n"
+    "<i>You don't need to wait for your request(s) to be approved - "
+    "submitting the request is enough to verify here.</i>"
 )
+
+
+async def send_gate_message(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, keyboard: InlineKeyboardMarkup
+):
+    """
+    Sends the gate message: the configured photo (via GATE_PHOTO_FILE_ID)
+    with WELCOME_TEXT as its caption, plus the Join/Verify keyboard.
+    Falls back to a plain text message if no photo is configured, or if
+    Telegram rejects the file_id (e.g. it was typed wrong or has expired).
+
+    Returns the sent Message object so callers can track its message_id
+    for later cleanup (see _track_gate_message / _cleanup_gate_messages).
+    """
+    if GATE_PHOTO_FILE_ID:
+        try:
+            return await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=GATE_PHOTO_FILE_ID,
+                caption=WELCOME_TEXT,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except (BadRequest, Forbidden) as exc:
+            logger.error(
+                "Could not send gate photo (file_id=%s): %s. Falling back "
+                "to text-only.",
+                GATE_PHOTO_FILE_ID,
+                exc,
+            )
+
+    return await context.bot.send_message(
+        chat_id=chat_id,
+        text=WELCOME_TEXT,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+def _track_gate_message(
+    context: ContextTypes.DEFAULT_TYPE, campaign_key: str, message_id: int
+) -> None:
+    """
+    Remembers a message_id (gate message, failed-verification notice, or
+    the user's own /start command) so it can be deleted in bulk once the
+    user successfully verifies for this campaign.
+    """
+    pending: Dict[str, list] = context.user_data.setdefault("pending_gate_messages", {})
+    pending.setdefault(campaign_key, []).append(message_id)
+
+
+async def _cleanup_gate_messages(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, campaign_key: str
+) -> None:
+    """
+    Deletes every message tracked for this campaign (the user's /start,
+    every gate message shown, and every failed-verification notice sent),
+    then clears the tracking list. Each delete is attempted independently
+    so one failure (e.g. a message older than 48h) doesn't block the rest.
+    """
+    pending: Dict[str, list] = context.user_data.get("pending_gate_messages", {})
+    message_ids = pending.pop(campaign_key, [])
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except (BadRequest, Forbidden) as exc:
+            logger.warning(
+                "Could not delete message %s in chat %s: %s", message_id, chat_id, exc
+            )
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -445,11 +520,12 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     campaign = CAMPAIGNS[param]
     keyboard = build_gate_keyboard(campaign["channels"], param)
 
-    await message.reply_text(
-        text=WELCOME_TEXT,
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
+    # Track the user's own /start message so it can be deleted along with
+    # the gate message(s) once they successfully verify.
+    _track_gate_message(context, param, message.message_id)
+
+    gate_message = await send_gate_message(context, chat_id=message.chat_id, keyboard=keyboard)
+    _track_gate_message(context, param, gate_message.message_id)
 
 
 async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -510,10 +586,10 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     verified = await check_campaign_verified(context, user.id, campaign)
 
     if verified:
-        try:
-            await query.message.delete()
-        except (BadRequest, Forbidden) as exc:
-            logger.warning("Could not delete gate message for user %s: %s", user.id, exc)
+        # Deletes the user's original /start message, every gate message
+        # shown so far, and every failed-verification notice sent for this
+        # campaign - all in one go.
+        await _cleanup_gate_messages(context, chat_id=user.id, campaign_key=campaign_key)
 
         destination_keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(text="Download", url=destination_link)]]
@@ -525,17 +601,35 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
     else:
         keyboard = build_gate_keyboard(campaign["channels"], campaign_key)
-        await context.bot.send_message(
+
+        failure_message = await context.bot.send_message(
             chat_id=user.id,
-            text=(
-                "❌ We haven't received a join request from you for all "
-                "required channels yet.\n\n"
-                "Please tap each *Join* button, submit a join request in "
-                "every channel, then come back and tap *Verify* again."
-            ),
-            parse_mode="Markdown",
-            reply_markup=keyboard,
+            text="We prefer you joining all the channels to get the link",
         )
+        _track_gate_message(context, campaign_key, failure_message.message_id)
+
+        gate_message = await send_gate_message(context, chat_id=user.id, keyboard=keyboard)
+        _track_gate_message(context, campaign_key, gate_message.message_id)
+
+
+async def get_file_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Utility handler: send any photo directly to the bot in a private chat,
+    and it replies with that photo's file_id - the value to put in the
+    GATE_PHOTO_FILE_ID environment variable.
+
+    Telegram stores several sizes per photo; update.message.photo[-1] is
+    always the largest/highest-resolution one, which is what you want here.
+    """
+    message = update.message
+    if message is None or not message.photo:
+        return
+    file_id = message.photo[-1].file_id
+    await message.reply_text(
+        f"file_id:\n<code>{file_id}</code>\n\n"
+        "Set this as GATE_PHOTO_FILE_ID in your environment variables.",
+        parse_mode="HTML",
+    )
 
 
 async def unknown_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -581,6 +675,11 @@ def main() -> None:
 
     # /start (with or without a deep-link parameter)
     application.add_handler(CommandHandler("start", start_handler))
+
+    # Utility: send any photo directly to the bot to get back its file_id,
+    # for use as GATE_PHOTO_FILE_ID. Safe to remove once you have the ID(s)
+    # you need, though harmless to leave in.
+    application.add_handler(MessageHandler(filters.PHOTO, get_file_id_handler))
 
     # Fires the instant a user submits a join request in any chat where the
     # bot is an admin. This MUST also be included in allowed_updates below,
