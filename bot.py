@@ -423,10 +423,6 @@ def build_gate_keyboard(
 
 WELCOME_TEXT = (
     "<blockquote>Join the following channels to continue</blockquote>\n\n"
-    "Tap each <b>Join</b> button below and submit a join request in every "
-    "channel listed, then come back and tap <b>Verify</b>.\n\n"
-    "<i>You don't need to wait for your request(s) to be approved - "
-    "submitting the request is enough to verify here.</i>"
 )
 
 
