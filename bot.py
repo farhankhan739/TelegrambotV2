@@ -402,12 +402,10 @@ def build_gate_keyboard(
     channels: list, campaign_key: str
 ) -> InlineKeyboardMarkup:
     """
-    Builds the gate keyboard shown on /start:
-        1. One "Join <label>" button per channel, packed 2-per-row (the
-           last row has 1 button if the channel count is odd).
-        2. A single Verify (callback button) on its own row below all the
-           join buttons - checks whether we've received a chat_join_request
-           event for this user for EVERY channel in the campaign.
+    Builds the gate keyboard shown on /start: every "Join <label>" button
+    plus the Verify button, packed together 2-per-row (in that order, so
+    Verify slots in next to the last join button if the channel count is
+    odd, rather than always getting its own row).
     """
     join_buttons = [
         InlineKeyboardButton(
@@ -416,8 +414,11 @@ def build_gate_keyboard(
         )
         for channel in channels
     ]
-    rows = [join_buttons[i:i + 2] for i in range(0, len(join_buttons), 2)]
-    rows.append([InlineKeyboardButton(text="✅ Verify", callback_data=f"verify:{campaign_key}")])
+    verify_button = InlineKeyboardButton(
+        text="✅ Verify", callback_data=f"verify:{campaign_key}"
+    )
+    all_buttons = join_buttons + [verify_button]
+    rows = [all_buttons[i:i + 2] for i in range(0, len(all_buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
 
